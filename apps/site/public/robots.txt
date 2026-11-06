@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://vtm-market.com/sitemap.xml

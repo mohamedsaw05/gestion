@@ -1,0 +1,7 @@
+TRANSCRIPTION DU TUTORIEL : Configurer son Espace de Travail
+Identité : VTM — ViralTech Market
+
+[00:00:00.000] Tutoriel VTM : Configurer votre espace. Rendez-vous dans le menu Paramètres situé dans la barre latérale gauche.
+[00:00:08.046] Indiquez la raison sociale de votre boutique, votre adresse, et choisissez votre devise de facturation, comme le Franc CFA XOF.
+[00:00:17.512] Importez votre logo officiel : il apparaîtra automatiquement sur vos factures, devis et tickets de caisse imprimés.
+[00:00:25.559] Créez vos magasins et dépôts dans Emplacements puis enregistrez. Prochaine étape : la recherche de produits et consultation de stock !

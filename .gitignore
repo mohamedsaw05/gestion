@@ -1,0 +1,32 @@
+node_modules/
+dist/
+build/
+coverage/
+# Environment files
+.env
+.env.*.local
+.env.local
+.env.test
+.env.production
+!.env.example
+!.env.production.example
+
+# Logs & temp
+*.log
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+
+# Archives & Staging
+*.zip
+*.tar.gz
+release/
+staging/
+backups/
+*.dump
+*.sql
+
+# Données clients et fichiers générés localement
+/uploads/
+**/uploads/
+*.tsbuildinfo

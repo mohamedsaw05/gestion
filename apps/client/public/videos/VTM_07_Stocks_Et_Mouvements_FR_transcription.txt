@@ -1,0 +1,7 @@
+TRANSCRIPTION DU TUTORIEL : Traçabilité des Stocks & Transferts
+Identité : VTM — ViralTech Market
+
+[00:00:00.000] Tutoriel VTM : Gestion des Stocks et Mouvements. Assurez la traçabilité intégrale de vos marchandises entre vos dépôts.
+[00:00:08.772] Chaque entrée, vente ou ajustement est inscrit dans un journal immuable. Les alertes automatiques préviennent toute rupture.
+[00:00:17.056] Transférez facilement des marchandises d'un entrepôt vers une boutique avec suivi rigoureux des quantités en transit.
+[00:00:24.854] Valorisez votre inventaire au coût moyen pondéré. Prochain épisode : les créances clients et le recouvrement !

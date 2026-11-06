@@ -1,0 +1,45 @@
+{
+  "name": "gestionnaire-universel",
+  "version": "1.0.4",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:infra": "docker compose up -d",
+    "dev:infra:down": "docker compose down",
+    "dev:infra:logs": "docker compose logs -f",
+    "dev:api": "npm run start:dev --workspace apps/api",
+    "dev:client": "npm run dev --workspace @gestionnaire/client",
+    "dev:admin": "npm run dev --workspace @gestionnaire/admin",
+    "dev:site": "npm run dev --workspace @gestionnaire/site",
+    "dev:web": "npm run dev:client",
+    "db:generate": "npm run generate --workspace @gestionnaire/db",
+    "db:migrate": "npm run migrate:dev --workspace @gestionnaire/db",
+    "db:migrate:deploy": "npm run migrate:deploy --workspace @gestionnaire/db",
+    "db:seed": "npm run seed --workspace @gestionnaire/db",
+    "build:shared": "npm run build --workspace @gestionnaire/shared",
+    "build:db": "npm run build --workspace @gestionnaire/db",
+    "build:client": "npm run build --workspace @gestionnaire/client",
+    "build:admin": "npm run build --workspace @gestionnaire/admin",
+    "build:site": "npm run build --workspace @gestionnaire/site",
+    "build": "npm run build:shared && npm run build:db && npm run build --workspace apps/api && npm run build:client && npm run build:admin && npm run build:site",
+    "lint": "npm run lint --workspace apps/api && npm run lint --workspace @gestionnaire/client && npm run lint --workspace @gestionnaire/admin",
+    "test": "npm run test:api && npm run test:api:e2e",
+    "test:api": "npm run test --workspace apps/api",
+    "test:api:e2e": "npm run test:e2e --workspace apps/api",
+    "platform:create-admin": "tsx scripts/create-superadmin.ts",
+    "vtm:doctor": "node scripts/vtm-doctor.mjs",
+    "vtm:dev": "node scripts/vtm-dev.mjs",
+    "release:package": "node scripts/release-package.mjs",
+    "zip:source": "node scripts/create-source-zip.mjs"
+  },
+  "allowScripts": {
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "esbuild@0.28.2": true,
+    "prisma@6.19.3": true,
+    "argon2@0.45.1": true
+  }
+}

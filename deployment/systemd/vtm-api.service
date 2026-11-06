@@ -1,0 +1,24 @@
+[Unit]
+Description=Gestionnaire Commercial SaaS VTM — API NestJS
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/vtm-saas
+EnvironmentFile=/var/www/vtm-saas/.env
+ExecStart=/usr/bin/node apps/api/dist/main.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vtm-api
+
+# Durcissement de sécurité Linux
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

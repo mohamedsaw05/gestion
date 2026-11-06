@@ -1,0 +1,1668 @@
+// Schéma Prisma — noyau transactionnel (Phase 1 + 2)
+// Portée volontairement limitée à ce qui est IMPLEMENTED selon docs/PROJECT_STATUS.md :
+// Tenant, Identity, RBAC, Catalog (simplifié), Inventory, Sales (simplifié), Payment
+// (multi-méthode + partiel), Document (reçu minimal, numérotation par emplacement),
+// Events (outbox), Audit, Device.
+// Les moteurs Pricing avancé, Credit/Debt, Cash Register, Order, Purchase, Delivery,
+// Automation, Notification, Search, Assistant ne sont PAS encore modélisés ici (voir statut).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLATFORM / TENANT
+// ─────────────────────────────────────────────────────────────────────────
+
+model Tenant {
+  id        String    @id @db.Uuid
+  name      String
+  status    String    @default("ACTIVE") // ACTIVE | GRACE_PERIOD | SUSPENDED
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLATFORM SAAS / PLANS / SUBSCRIPTIONS / INVOICES / SUPERADMIN
+// cf docs/architecture/09-abonnements-saas.md et 02-moteurs.md §1
+// Espace plateforme strictement séparé des tenants : gestion des plans,
+// souscriptions, quotas, factures d'abonnement SaaS, et superadmins éditeur.
+// ─────────────────────────────────────────────────────────────────────────
+
+model PlatformAdminUser {
+  id           String   @id @db.Uuid
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         String   @default("SUPERADMIN") // SUPERADMIN | SUPPORT
+  status       String   @default("ACTIVE") // ACTIVE | INACTIVE
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// Configuration globale de la plateforme (Super Admin), persistée dans PostgreSQL.
+model PlatformConfig {
+  id        String   @id @db.Uuid
+  key       String   @unique
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PlatformTariffHistory {
+  id                  String   @id @db.Uuid
+  previousMonthlyPrice Int
+  monthlyPrice        Int
+  actorId             String   @db.Uuid
+  actorEmail          String
+  reason              String?
+  changedAt            DateTime @default(now())
+  effectiveAt          DateTime
+
+  @@index([changedAt])
+}
+
+model PlatformPlan {
+  id                  String   @id @db.Uuid
+  key                 String   @unique // TRIAL | STARTER | PRO | ENTERPRISE
+  name                String
+  description         String?
+  priceMonthly        Decimal  @db.Decimal(12, 4)
+  currency            String   @default("XOF")
+  trialDays           Int      @default(0) // > 0 pour les offres d'essai gratuit
+  maxUsers            Int      @default(2) // Quota strict utilisateurs actifs
+  maxLocations        Int      @default(1) // Quota strict emplacements actifs
+  maxMonthlySales     Int      @default(500) // Quota transactions de vente par mois (0 = illimité)
+  allowedCapabilities String[] // Liste blanche des capabilities autorisées dans ce plan
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  subscriptions PlatformSubscription[]
+}
+
+model PlatformSubscription {
+  id                 String    @id @db.Uuid
+  tenantId           String    @unique @db.Uuid
+  planId             String    @db.Uuid
+  status             String    @default("TRIALING") // TRIALING | ACTIVE | PAST_DUE | GRACE_PERIOD | SUSPENDED | CANCELLED
+  startedAt          DateTime  @default(now())
+  currentPeriodStart DateTime  @default(now())
+  currentPeriodEnd   DateTime
+  gracePeriodEnd     DateTime?
+  cancelledAt        DateTime?
+  suspendedAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  plan     PlatformPlan      @relation(fields: [planId], references: [id], onDelete: Restrict)
+  invoices PlatformInvoice[]
+
+  @@index([tenantId])
+  @@index([status])
+}
+
+model PlatformInvoice {
+  id               String    @id @db.Uuid
+  tenantId         String    @db.Uuid
+  subscriptionId   String?   @db.Uuid
+  invoiceNumber    String    @unique // ex: SAAS-2026-000001
+  amount           Decimal   @db.Decimal(12, 4)
+  currency         String    @default("XOF")
+  status           String    @default("PENDING") // PENDING | PAID | VOID
+  paymentMethod    String    @default("MANUAL_TRANSFER") // MANUAL_TRANSFER | CASH | CARD | MOBILE_MONEY
+  paymentReference String?
+  paidAt           DateTime?
+  periodStart      DateTime
+  periodEnd        DateTime
+  notes            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  subscription PlatformSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([status])
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// BUSINESS PROFILE / CAPABILITIES / MODULES
+// cf docs/architecture (extension) — le moteur commun reste unique ; ce qui
+// change d'un commerce à l'autre, c'est cette configuration, jamais le code.
+// Catalogues des clés valides codés dans packages/db/src/capabilities.catalog.ts
+// et modules.catalog.ts (même principe que permissions/settings : jamais une
+// clé libre non documentée).
+// ─────────────────────────────────────────────────────────────────────────
+
+// Un seul profil par tenant. `businessType` sert UNIQUEMENT à proposer une
+// configuration initiale dans l'assistant — jamais une condition dans le code
+// métier (pas de `if businessType === 'RESTAURANT'` ailleurs dans le système).
+model BusinessProfile {
+  id           String    @id @db.Uuid
+  tenantId     String    @unique @db.Uuid
+  businessType String // catalogue indicatif (BOUTIQUE, RESTAURANT, ... OTHER) — jamais bloquant
+  onboardedAt  DateTime? // null = assistant de configuration pas encore complété
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// Capacité RÉELLEMENT activée/utilisée par CE commerce (cf distinction
+// capability/module/permission/setting). Absence de ligne = valeur par défaut
+// du catalogue codé, jamais une erreur (résolution identique à TenantSetting).
+model TenantCapability {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  key       String
+  enabled   Boolean
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+}
+
+// Activation/désactivation d'un MODULE (domaine fonctionnel) par ce tenant —
+// distinct d'une capability : un module peut exister dans le registre sans
+// être exposé (catégorie CORE/AUTOMATIC toujours actives, non stockées ici).
+// Un module lié à une capability désactivée reste désactivé quoi qu'il arrive
+// (la capability est un prérequis, jamais contournable par ce réglage).
+model TenantModule {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  key       String
+  enabled   Boolean
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+}
+
+model Location {
+  id             String    @id @db.Uuid
+  tenantId       String    @db.Uuid
+  name           String
+  normalizedName String    @default("")
+  type           String // STORE | WAREHOUSE | PICKUP_POINT
+  createdAt      DateTime  @default(now())
+  deletedAt      DateTime?
+
+  @@index([tenantId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CONFIGURATION (Configuration Engine — cf docs/architecture/02-moteurs.md §7)
+// Catalogue des clés valides codé dans packages/db/src/settings.catalog.ts,
+// même principe que les permissions : jamais une clé libre non documentée.
+// ─────────────────────────────────────────────────────────────────────────
+
+model TenantSetting {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  key       String
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+}
+
+// Surcharge par emplacement (Phase 8.1 — résolution hiérarchique) : ne
+// s'applique qu'aux clés marquées `allowLocationOverride: true` dans le
+// catalogue codé (validé applicativement, jamais au niveau schéma). Résolution
+// effective : LocationSetting > TenantSetting > défaut du catalogue.
+model LocationSetting {
+  id         String   @id @db.Uuid
+  tenantId   String   @db.Uuid
+  locationId String   @db.Uuid
+  key        String
+  value      Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([tenantId, locationId, key])
+  @@index([tenantId, locationId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// IDENTITY / RBAC
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id            String         @id @db.Uuid
+  tenantId      String         @db.Uuid
+  email         String
+  passwordHash  String
+  fullName      String
+  status        String         @default("ACTIVE") // ACTIVE | DISABLED
+  createdAt     DateTime       @default(now())
+  deletedAt     DateTime?
+  userRoles     UserRole[]
+  refreshTokens RefreshToken[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+}
+
+// Le catalogue des permissions atomiques ("sales.create", "inventory.stock.adjust", ...)
+// est codé en dur dans apps/api/src/rbac/permissions.catalog.ts (source de vérité),
+// PAS une table librement éditable — décision actée dans docs/architecture/02-moteurs.md §4.
+model Role {
+  id          String           @id @db.Uuid
+  tenantId    String?          @db.Uuid // null = rôle-modèle plateforme (template global, cloné par tenant)
+  key         String // slug stable, ex: "sales_user"
+  name        String
+  isTemplate  Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+  permissions RolePermission[]
+  userRoles   UserRole[]
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+}
+
+model RolePermission {
+  id            String  @id @db.Uuid
+  tenantId      String? @db.Uuid // dénormalisé depuis Role.tenantId, pour permettre le RLS sur cette table aussi
+  roleId        String  @db.Uuid
+  permissionKey String // validé au runtime contre permissions.catalog.ts
+  role          Role    @relation(fields: [roleId], references: [id])
+
+  @@unique([roleId, permissionKey])
+  @@index([tenantId])
+}
+
+model UserRole {
+  id               String   @id @db.Uuid
+  tenantId         String   @db.Uuid
+  userId           String   @db.Uuid
+  roleId           String   @db.Uuid
+  scopeType        String // ALL_LOCATIONS | LOCATIONS | OWN_RECORDS | TEAM
+  scopeLocationIds String[] // utilisé uniquement si scopeType = LOCATIONS
+  createdAt        DateTime @default(now())
+  user             User     @relation(fields: [userId], references: [id])
+  role             Role     @relation(fields: [roleId], references: [id])
+
+  @@index([tenantId, userId])
+}
+
+// Invitation par email (Phase 8.4 §3) — l'envoi réel de l'email est abstrait
+// (PLANNED, dépend du Notification Engine) : le lien est retourné une seule
+// fois à l'émetteur (même principe que le mot de passe temporaire), jamais
+// stocké en clair. Le tenant d'une invitation ne change JAMAIS : l'acceptation
+// re-fournit ce même tenantId, elle ne le déduit jamais d'ailleurs.
+model Invitation {
+  id               String    @id @db.Uuid
+  tenantId         String    @db.Uuid
+  email            String
+  roleId           String    @db.Uuid
+  scopeType        String
+  scopeLocationIds String[]
+  tokenHash        String
+  status           String    @default("PENDING") // PENDING | ACCEPTED | REVOKED
+  invitedByUserId  String    @db.Uuid
+  expiresAt        DateTime
+  acceptedAt       DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@unique([tenantId, tokenHash])
+  @@index([tenantId, email])
+}
+
+model RefreshToken {
+  id        String    @id @db.Uuid
+  tenantId  String    @db.Uuid
+  userId    String    @db.Uuid
+  deviceId  String?   @db.Uuid
+  tokenHash String
+  revokedAt DateTime?
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([tenantId, userId])
+}
+
+model Device {
+  id         String    @id @db.Uuid
+  tenantId   String    @db.Uuid
+  name       String
+  secretHash String
+  status     String    @default("ACTIVE") // ACTIVE | REVOKED
+  lastSyncAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([tenantId])
+}
+
+model LearningProgress {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  userId    String   @db.Uuid
+  guideKey  String
+  progress  Json
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, userId, guideKey])
+  @@index([tenantId, userId])
+}
+
+model SupportTicket {
+  id              String   @id @db.Uuid
+  tenantId        String   @db.Uuid
+  userId          String   @db.Uuid
+  subject         String
+  message         String
+  status          String   @default("OPEN")
+  supportResponse String?
+  respondedBy     String?
+  respondedAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([tenantId, createdAt])
+  @@index([status, createdAt])
+}
+
+model PrinterProfile {
+  id             String   @id @db.Uuid
+  tenantId       String   @db.Uuid
+  name           String
+  type           String
+  brand          String?
+  model          String?
+  connectionMode String
+  terminalId     String
+  paperFormat    String
+  locationId     String?
+  cashRegisterId String?
+  config         Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([tenantId, terminalId, name])
+  @@index([tenantId, terminalId])
+  @@index([tenantId, locationId, cashRegisterId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CATALOG (simplifié — Unit/Pricing avancés = PLANNED)
+// ─────────────────────────────────────────────────────────────────────────
+
+model Category {
+  id        String    @id @db.Uuid
+  tenantId  String    @db.Uuid
+  name      String
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+
+  @@index([tenantId])
+}
+
+model Product {
+  id         String    @id @db.Uuid
+  tenantId   String    @db.Uuid
+  categoryId String?   @db.Uuid
+  sku        String
+  name       String
+  brand      String?
+  // PHYSICAL (par défaut) | SERVICE (jamais stocké) | BUNDLE (composition
+  // d'autres produits, jamais stocké directement — cf BundleComponent).
+  // Abonnements, produits personnalisés = PLANNED (cf docs/PROJECT_STATUS.md).
+  type       String    @default("PHYSICAL")
+  unit       String // unité de RÉFÉRENCE (= unité de stock) — cf ProductUnit pour les unités alternatives
+  basePrice  Decimal   @db.Decimal(18, 4) // Pricing Engine (listes de prix, promotions) = PLANNED
+  costPrice  Decimal?  @db.Decimal(18, 4) // Coût unitaire d'achat de référence / valorisation par défaut
+  currency   String    @default("XOF")
+  isStocked  Boolean   @default(true)
+  isFractional Boolean @default(false) // true si le produit autorise les décimales (ex: kg, litre), false si comptage entier strict (ex: pièce, carton)
+  status     String    @default("ACTIVE") // ACTIVE | ARCHIVED
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
+
+  // ── Variantes (Phase 12, capability "variants") ────────────────────────
+  // Une variante EST un Product à part entière (propre SKU, propre stock,
+  // propre prix) rattaché à un produit "parent" via `parentProductId` —
+  // décision de conception délibérée : plutôt qu'un modèle ProductVariant
+  // séparé qui aurait fallu brancher dans Stock/Sales/Purchase/Returns (donc
+  // dupliquer toute la logique déjà éprouvée), une variante traverse ces
+  // moteurs SANS AUCUNE modification, exactement comme n'importe quel autre
+  // produit. `hasVariants` sur le parent est vrai dès qu'au moins une
+  // variante existe ; le parent lui-même devient alors non vendable
+  // directement (SalesService le refuse, cf CatalogService.addVariant qui
+  // force aussi son isStocked à faux — il n'a plus de stock propre à suivre).
+  // Une variante de variante (parentProductId en chaîne) est refusée.
+  parentProductId   String? @db.Uuid
+  variantAttributes Json? // ex: {"couleur":"Rouge","taille":"XL"} — figé à la création, jamais recalculé
+  hasVariants       Boolean @default(false)
+
+  // ── Numéros de série / IMEI (Phase 12, capability "serial_numbers") ────
+  // Quand actif, une vente/un retour de ce produit exige la liste exacte des
+  // numéros de série concernés (cf SerialNumber) — la quantité seule ne
+  // suffit plus à identifier QUELLE unité physique a été vendue.
+  tracksSerialNumbers Boolean @default(false)
+
+  // ── Lots / péremption (Phase 13, capability "batch_tracking") ──────────
+  // Quand actif, le stock de ce produit est décomposé en lots (StockBatch)
+  // avec date de péremption optionnelle, consommés FEFO (first-expire-
+  // first-out) à la vente — StockLevel.quantityOnHand reste la SEULE source
+  // de vérité du total, StockBatch en donne la répartition par lot.
+  tracksBatches Boolean @default(false)
+
+  @@unique([tenantId, sku])
+  @@index([tenantId])
+  @@index([tenantId, parentProductId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SERIAL NUMBERS (Phase 12, capability "serial_numbers"). Une unité physique
+// individuellement identifiée d'un produit qui le requiert (électronique,
+// informatique...). Enregistrement manuel via le catalogue pour cette phase
+// (ex: chargement du stock initial, correction) — l'enregistrement
+// automatique à la réception d'une commande fournisseur reste PLANNED (cf
+// docs/PROJECT_STATUS.md), pour ne pas alourdir le Purchase Engine dans
+// cette phase. `status` : AVAILABLE (en stock, vendable) | SOLD (vendu,
+// rattaché à sa ligne de vente) | RETURNED (revenu en stock après un retour
+// GOOD — redevient effectivement AVAILABLE, ce statut transitoire n'est pas
+// utilisé) | DEFECTIVE (retourné en mauvais état, jamais revendable).
+// ─────────────────────────────────────────────────────────────────────────
+model SerialNumber {
+  id         String    @id @db.Uuid
+  tenantId   String    @db.Uuid
+  productId  String    @db.Uuid
+  locationId String?   @db.Uuid // dernier emplacement connu ; conservé même après vente (traçabilité)
+  serial     String
+  status     String    @default("AVAILABLE") // AVAILABLE | SOLD | DEFECTIVE
+  saleLineId String?   @db.Uuid // renseigné dès la vente, conservé même si retourné (traçabilité)
+  createdAt  DateTime  @default(now())
+
+  @@unique([tenantId, productId, serial])
+  @@index([tenantId, productId, status])
+  @@index([tenantId, saleLineId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// GARANTIES (Phase 12, capability "warranties"). WarrantyPolicy définit la
+// durée par défaut pour un produit ; Warranty est l'enregistrement CONCRET
+// créé automatiquement à la vente si une politique existe pour le produit
+// vendu (une par SaleLine, jamais recalculée depuis la politique qui a pu
+// changer depuis — snapshot immuable, même principe que SaleLine elle-même).
+// L'expiration est calculée à la LECTURE (`expiresAt` comparé à `now()`),
+// jamais par un job planifié qui ferait passer `status` à EXPIRED tout seul
+// — un Automation/Scheduler dédié reste PLANNED (dépend de l'Automation
+// Engine, lui-même PLANNED). `status` ne change qu'à une action explicite :
+// CLAIMED (réclamation traitée) ou VOID (annulée manuellement).
+// ─────────────────────────────────────────────────────────────────────────
+model WarrantyPolicy {
+  id           String   @id @db.Uuid
+  tenantId     String   @db.Uuid
+  productId    String   @db.Uuid
+  durationDays Int
+  durationMonths Int    @default(0)
+  warrantyType String  @default("STANDARD")
+  terms        String?
+  exclusions   String?
+  createdAt    DateTime @default(now())
+
+  @@unique([tenantId, productId])
+  @@index([tenantId])
+}
+
+model Warranty {
+  id                   String    @id @db.Uuid
+  tenantId             String    @db.Uuid
+  reference            String    @default("")
+  saleId               String?   @db.Uuid
+  saleLineId           String?   @db.Uuid
+  invoiceNumberSnapshot String?
+  productId            String    @db.Uuid
+  productNameSnapshot  String
+  locationId           String?   @db.Uuid
+  customerId           String?   @db.Uuid
+  customerNameSnapshot String?
+  customerPhoneSnapshot String?
+  durationDaysSnapshot Int
+  durationMonthsSnapshot Int   @default(0)
+  termsSnapshot        String?
+  exclusionsSnapshot   String?
+  warrantyTypeSnapshot String   @default("STANDARD")
+  serialNumber         String?
+  normalizedSerialNumber String?
+  lotNumber            String?
+  identifiers          Json      @default("[]")
+  notes                String?
+  createdByUserId      String?   @db.Uuid
+  startDate            DateTime
+  expiresAt            DateTime
+  status               String    @default("ACTIVE") // ACTIVE | CLAIMED | IN_REPAIR | CLOSED | VOID (expiré/proche échéance calculés à la lecture)
+  claimedAt            DateTime?
+  claimNotes           String?
+  createdAt            DateTime  @default(now())
+
+  @@index([tenantId, saleId])
+  @@index([tenantId, expiresAt])
+  @@index([tenantId, customerId])
+  @@unique([tenantId, reference])
+}
+
+model WarrantyConfiguration {
+  id        String   @id @db.Uuid
+  tenantId  String   @unique @db.Uuid
+  config    Json
+  updatedByUserId String? @db.Uuid
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Progressive purchase deposits are stored as an immutable ledger. Deposits
+// are not sales revenue until a real Sale is created at product pickup.
+model ProgressivePurchaseCase {
+  id                    String   @id @db.Uuid
+  tenantId              String   @db.Uuid
+  locationId            String   @db.Uuid
+  customerId            String   @db.Uuid
+  reference             String
+  status                String   @default("OPEN") // OPEN | PRODUCT_SELECTED | READY_FOR_PICKUP | REDEEMED | CANCELLED | REFUNDED
+  productId             String?  @db.Uuid
+  productNameSnapshot   String?
+  productPriceSnapshot  Decimal? @db.Decimal(18, 4)
+  currency              String
+  saleOperationId       String   @db.Uuid
+  saleId                String?  @db.Uuid
+  notes                 String?
+  createdByUserId       String   @db.Uuid
+  responsibleUserId     String?  @db.Uuid
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([tenantId, reference])
+  @@unique([tenantId, saleOperationId])
+  @@index([tenantId, locationId, status, createdAt])
+  @@index([tenantId, customerId, createdAt])
+  @@index([tenantId, productId])
+}
+
+model ProgressivePurchaseMovement {
+  id                    String   @id @db.Uuid
+  tenantId              String   @db.Uuid
+  caseId                String   @db.Uuid
+  operationId           String?  @db.Uuid
+  kind                  String // DEPOSIT | APPLIED | REFUND
+  amount                Decimal  @db.Decimal(18, 4)
+  currency              String
+  paymentMethod         String
+  paymentReference      String?
+  receiptNumber         String?
+  balanceBefore         Decimal  @db.Decimal(18, 4)
+  balanceAfter          Decimal  @db.Decimal(18, 4)
+  receiptSnapshot       Json
+  saleId                String?  @db.Uuid
+  createdByUserId       String   @db.Uuid
+  createdAt             DateTime @default(now())
+
+  @@unique([tenantId, receiptNumber])
+  @@unique([tenantId, operationId])
+  @@index([tenantId, caseId, createdAt])
+  @@index([tenantId, kind, createdAt])
+}
+
+// Codes-barres multiples par produit (ex: unité + carton) — cf
+// docs/architecture/02-moteurs.md §6. Un code est unique au niveau du tenant
+// (deux produits ne peuvent pas partager un même code-barres).
+model ProductBarcode {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  productId String   @db.Uuid
+  code      String
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, code])
+  @@index([tenantId, productId])
+}
+
+model ProductAlias {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  productId String   @db.Uuid
+  alias     String
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, productId, alias])
+  @@index([tenantId, alias])
+  @@index([tenantId, productId])
+}
+
+// Composition d'un produit BUNDLE : quantité de `componentProductId` requise
+// pour 1 unité de référence du bundle vendu. À la vente, le stock est
+// décrémenté sur CHAQUE composant, jamais sur le bundle lui-même (isStocked=false).
+model BundleComponent {
+  id                 String   @id @db.Uuid
+  tenantId           String   @db.Uuid
+  bundleProductId    String   @db.Uuid
+  componentProductId String   @db.Uuid
+  quantity           Decimal  @db.Decimal(18, 4)
+  createdAt          DateTime @default(now())
+
+  @@unique([tenantId, bundleProductId, componentProductId])
+  @@index([tenantId, bundleProductId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// UNIT / CONVERSION (cf docs/architecture/02-moteurs.md §7 bis)
+// Product.unit est l'unité de RÉFÉRENCE (= unité de stock, jamais convertie).
+// ProductUnit déclare des unités ALTERNATIVES (achat/vente) avec un facteur de
+// conversion vers cette référence : 1 {unit} = {factor} × unité de référence.
+// Ex: unit="carton", factor=12 → 1 carton = 12 pièces (si Product.unit="piece").
+// ─────────────────────────────────────────────────────────────────────────
+
+model ProductUnit {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  productId String   @db.Uuid
+  unit      String
+  factor    Decimal  @db.Decimal(18, 6)
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, productId, unit])
+  @@index([tenantId, productId])
+}
+
+model Customer {
+  id          String    @id @db.Uuid
+  tenantId    String    @db.Uuid
+  name        String
+  phone       String?
+  email       String?
+  // null = pas de limite. Vérifiée par le Credit Engine avant toute vente à
+  // crédit (cf docs/architecture/02-moteurs.md §14).
+  creditLimit Decimal?  @db.Decimal(18, 4)
+  createdAt   DateTime  @default(now())
+  deletedAt   DateTime?
+
+  @@index([tenantId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PRICING (simplifié — cf docs/architecture/02-moteurs.md §8)
+// Résolution : prix négocié client > palier de quantité > prix de base.
+// Promotions temporelles, listes de prix par groupe client = PLANNED.
+// ─────────────────────────────────────────────────────────────────────────
+
+model CustomerPriceOverride {
+  id         String   @id @db.Uuid
+  tenantId   String   @db.Uuid
+  customerId String   @db.Uuid
+  productId  String   @db.Uuid
+  price      Decimal  @db.Decimal(18, 4)
+  createdAt  DateTime @default(now())
+
+  @@unique([tenantId, customerId, productId])
+  @@index([tenantId])
+}
+
+model QuantityPriceTier {
+  id          String   @id @db.Uuid
+  tenantId    String   @db.Uuid
+  productId   String   @db.Uuid
+  minQuantity Decimal  @db.Decimal(18, 4)
+  price       Decimal  @db.Decimal(18, 4)
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId, productId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CREDIT / DEBT (cf docs/architecture/02-moteurs.md §14)
+// ─────────────────────────────────────────────────────────────────────────
+
+model CreditAccount {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  customerId String  @db.Uuid
+  // > 0 = le client doit de l'argent au tenant. Toujours recalculable à partir
+  // du journal CreditMovement (même principe que StockLevel, cf
+  // docs/architecture/03-modele-donnees.md §3.2).
+  balance   Decimal  @default(0) @db.Decimal(18, 4)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, customerId])
+  @@index([tenantId])
+}
+
+// Append-only : ne jamais UPDATE/DELETE une ligne existante depuis le code applicatif.
+model CreditMovement {
+  id            String   @id @db.Uuid
+  tenantId      String   @db.Uuid
+  accountId     String   @db.Uuid
+  movementType  String // DEBIT (augmente la dette, ex: vente à crédit) | CREDIT (réduit la dette, ex: remboursement)
+  amount        Decimal  @db.Decimal(18, 4) // toujours positif ; le sens est donné par movementType
+  method        String? // méthode de remboursement si CREDIT : CASH | MOBILE_MONEY | CARD | BANK_TRANSFER | CHECK
+  referenceType String // sale | repayment
+  referenceId   String   @db.Uuid
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, accountId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// INVENTORY
+// ─────────────────────────────────────────────────────────────────────────
+
+model StockLevel {
+  id               String   @id @db.Uuid
+  tenantId         String   @db.Uuid
+  locationId       String   @db.Uuid
+  productId        String   @db.Uuid
+  quantityOnHand   Decimal  @default(0) @db.Decimal(18, 4)
+  quantityReserved Decimal  @default(0) @db.Decimal(18, 4)
+  updatedAt        DateTime @updatedAt
+
+  @@unique([tenantId, locationId, productId])
+  @@index([tenantId])
+}
+
+// Append-only : source de vérité du stock (cf docs/architecture/03-modele-donnees.md §3.2).
+// Ne jamais UPDATE/DELETE une ligne existante depuis le code applicatif.
+model StockMovement {
+  id            String   @id @db.Uuid
+  tenantId      String   @db.Uuid
+  locationId    String   @db.Uuid
+  productId     String   @db.Uuid
+  movementType  String // sale | purchase_receipt | adjustment | transfer_in | transfer_out | return
+  quantity      Decimal  @db.Decimal(18, 4) // signé (+ entrée, - sortie)
+  referenceType String
+  referenceId   String   @db.Uuid
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, productId, locationId])
+  @@index([tenantId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TRANSFERTS DE STOCK (Phase 13 — capabilities "inventory" ET
+// "multiple_locations" toutes deux requises, sans capability dédiée : un
+// transfert n'a de sens que si le stock ET plusieurs emplacements existent
+// déjà, ajouter une troisième capability purement pour ça serait décoratif).
+// Cycle DRAFT (créé, aucun mouvement) → CONFIRMED (stock RÉELLEMENT sorti de
+// l'emplacement source, movementType='transfer_out') → RECEIVED (stock
+// RÉELLEMENT entré à l'emplacement destination, movementType='transfer_in')
+// — la période CONFIRMED reflète honnêtement la marchandise "en transit"
+// (ni à l'un ni à l'autre emplacement), un état réel que peu de systèmes
+// modélisent explicitement. CANCELLED possible uniquement depuis DRAFT
+// (avant toute sortie de stock) — même règle que PurchaseOrder.
+// ─────────────────────────────────────────────────────────────────────────
+model StockTransfer {
+  id              String              @id @db.Uuid
+  tenantId        String              @db.Uuid
+  fromLocationId  String              @db.Uuid
+  toLocationId    String              @db.Uuid
+  status          String              @default("DRAFT") // DRAFT | CONFIRMED | RECEIVED | CANCELLED
+  createdByUserId String              @db.Uuid
+  operationId     String              @db.Uuid
+  cancelReason    String?
+  createdAt       DateTime            @default(now())
+  shippedAt       DateTime?
+  receivedAt      DateTime?
+  cancelledAt     DateTime?
+  lines           StockTransferLine[]
+
+  @@unique([tenantId, operationId])
+  @@index([tenantId, fromLocationId, status])
+  @@index([tenantId, toLocationId, status])
+}
+
+model StockTransferLine {
+  id                  String        @id @db.Uuid
+  tenantId            String        @db.Uuid
+  transferId          String        @db.Uuid
+  productId           String        @db.Uuid
+  productNameSnapshot String
+  // Toujours en unité de RÉFÉRENCE — un transfert interne n'a pas de notion
+  // de "prix vendu dans telle unité" comme une vente, pas d'unité
+  // alternative pour cette phase (PLANNED si un besoin réel apparaît).
+  quantity            Decimal       @db.Decimal(18, 4)
+  transfer            StockTransfer @relation(fields: [transferId], references: [id])
+
+  @@index([tenantId, transferId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// LOTS / PÉREMPTION (Phase 13, capability "batch_tracking"). StockBatch
+// DÉCOMPOSE le total déjà suivi par StockLevel.quantityOnHand — jamais une
+// deuxième source de vérité : chaque mouvement qui touche un produit à lots
+// (enregistrement initial, vente FEFO) met à jour LES DEUX en même temps
+// dans la même transaction. `quantity` ici = quantité RESTANTE de ce lot
+// précis à cet emplacement précis (jamais négative, jamais recalculée
+// depuis un journal séparé — contrairement à StockLevel qui reste la
+// source append-only via StockMovement).
+// ─────────────────────────────────────────────────────────────────────────
+model StockBatch {
+  id         String    @id @db.Uuid
+  tenantId   String    @db.Uuid
+  productId  String    @db.Uuid
+  locationId String    @db.Uuid
+  lotNumber  String
+  quantity   Decimal   @db.Decimal(18, 4)
+  expiresAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@unique([tenantId, productId, locationId, lotNumber])
+  @@index([tenantId, productId, locationId])
+  @@index([tenantId, expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SALES (simplifié — Order/Purchase/Credit/Cash Register/Document = PLANNED)
+// ─────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────
+// ORDER ENGINE (Phase 11 — cf docs/architecture/02-moteurs.md, capability
+// "orders"). Une COMMANDE n'est jamais confondue avec une VENTE (cf
+// continuation §11) : elle représente un engagement futur, sans effet sur le
+// stock avant sa complétion. La complétion délègue à SalesService.create —
+// c'est la Sale résultante qui décrémente réellement le stock, encaisse et
+// génère le document, jamais l'Order lui-même (pas de duplication de cette
+// logique transactionnelle déjà éprouvée).
+// Réservation de stock à la confirmation = PLANNED (dépend d'Inventory 2.0,
+// Phase 17 — états "reserved" non modélisés aujourd'hui, cf PROJECT_STATUS).
+// ─────────────────────────────────────────────────────────────────────────
+model Order {
+  id            String      @id @db.Uuid
+  tenantId      String      @db.Uuid
+  locationId    String      @db.Uuid
+  customerId    String?     @db.Uuid
+  sellerUserId  String      @db.Uuid
+  status        String      @default("DRAFT") // DRAFT | CONFIRMED | PREPARING | READY | COMPLETED | CANCELLED
+  currency      String
+  subtotal      Decimal     @db.Decimal(18, 4)
+  depositPaid   Decimal     @default(0) @db.Decimal(18, 4)
+  depositMethod String? // méthode du dernier acompte enregistré, reprise telle quelle à la complétion
+  operationId   String      @db.Uuid // idempotence (même principe que Sale.operationId)
+  saleId        String?     @db.Uuid // renseigné uniquement une fois COMPLETED
+  cancelReason  String?
+  createdAt     DateTime    @default(now())
+  confirmedAt   DateTime?
+  completedAt   DateTime?
+  cancelledAt   DateTime?
+  lines         OrderLine[]
+  documents     Document[]
+
+  @@unique([tenantId, operationId])
+  @@index([tenantId, locationId, status])
+}
+
+model OrderLine {
+  id                  String  @id @db.Uuid
+  tenantId            String  @db.Uuid
+  orderId             String  @db.Uuid
+  productId           String  @db.Uuid
+  productNameSnapshot String
+  unitSnapshot        String
+  quantity            Decimal @db.Decimal(18, 4)
+  // Phase 13 : nécessaire pour réserver le STOCK (toujours en unité de
+  // référence) sans re-résoudre la conversion d'unité à la confirmation —
+  // même principe de snapshot immuable que SaleLine/ReturnLine.
+  conversionFactorSnapshot Decimal @default(1) @db.Decimal(18, 6)
+  unitPriceSnapshot   Decimal @db.Decimal(18, 4)
+  lineTotal           Decimal @db.Decimal(18, 4)
+  order               Order   @relation(fields: [orderId], references: [id])
+
+  @@index([tenantId, orderId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PURCHASE ENGINE (Phase 10 — capability "purchases"). Symétrique du Credit
+// Engine côté achats : SupplierAccount/SupplierMovement reproduisent
+// exactement le pattern CreditAccount/CreditMovement (solde toujours
+// recalculable depuis un journal append-only), balance > 0 = LE TENANT doit
+// de l'argent AU FOURNISSEUR (sens inversé du crédit client).
+//
+// La réception incrémente le stock réel via
+// InventoryService.applyStockMovementWithTx (movementType "purchase_receipt",
+// déjà prévu dans le commentaire du modèle StockMovement) — jamais de
+// duplication de la logique de verrouillage pessimiste déjà éprouvée.
+//
+// SupplierInvoice distinct de la commande = PLANNED (pour cette phase, la
+// dette est incrémentée proportionnellement à la quantité RÉELLEMENT REÇUE,
+// pas à la commande — le coût unitaire est saisi à la commande, snapshoté,
+// jamais recalculé depuis un "prix de revient produit" qui n'existe pas
+// encore dans le modèle Product).
+// ─────────────────────────────────────────────────────────────────────────
+model Supplier {
+  id        String    @id @db.Uuid
+  tenantId  String    @db.Uuid
+  name      String
+  phone     String?
+  email     String?
+  address   String?
+  notes     String?
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+
+  @@index([tenantId])
+}
+
+model SupplierAccount {
+  id         String   @id @db.Uuid
+  tenantId   String   @db.Uuid
+  supplierId String   @db.Uuid
+  balance    Decimal  @default(0) @db.Decimal(18, 4)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([tenantId, supplierId])
+  @@index([tenantId])
+}
+
+model SupplierMovement {
+  id            String   @id @db.Uuid
+  tenantId      String   @db.Uuid
+  accountId     String   @db.Uuid
+  movementType  String // DEBIT (marchandise reçue, augmente la dette) | CREDIT (paiement au fournisseur, réduit la dette)
+  amount        Decimal  @db.Decimal(18, 4)
+  method        String? // méthode de paiement si CREDIT
+  referenceType String // purchase_receipt | payment
+  referenceId   String   @db.Uuid
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, accountId, createdAt])
+}
+
+model PurchaseOrder {
+  id              String              @id @db.Uuid
+  tenantId        String              @db.Uuid
+  supplierId      String              @db.Uuid
+  locationId      String              @db.Uuid
+  status          String              @default("DRAFT") // DRAFT | CONFIRMED | PARTIALLY_RECEIVED | RECEIVED | CANCELLED
+  currency        String
+  subtotal        Decimal             @db.Decimal(18, 4)
+  createdByUserId String              @db.Uuid
+  operationId     String              @db.Uuid
+  cancelReason    String?
+  createdAt       DateTime            @default(now())
+  confirmedAt     DateTime?
+  cancelledAt     DateTime?
+  lines           PurchaseOrderLine[]
+
+  @@unique([tenantId, operationId])
+  @@index([tenantId, supplierId, status])
+  @@index([tenantId, locationId])
+}
+
+model PurchaseOrderLine {
+  id                  String        @id @db.Uuid
+  tenantId            String        @db.Uuid
+  purchaseOrderId     String        @db.Uuid
+  productId           String        @db.Uuid
+  productNameSnapshot String
+  unitSnapshot        String
+  quantityOrdered     Decimal       @db.Decimal(18, 4)
+  quantityReceived    Decimal       @default(0) @db.Decimal(18, 4)
+  unitCostSnapshot    Decimal       @db.Decimal(18, 4)
+  lineTotal           Decimal       @db.Decimal(18, 4)
+  purchaseOrder       PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+
+  @@index([tenantId, purchaseOrderId])
+}
+
+model Sale {
+  id            String     @id @db.Uuid // UUID v7 généré côté application (compatibilité offline future)
+  tenantId      String     @db.Uuid
+  locationId    String     @db.Uuid
+  customerId    String?    @db.Uuid
+  sellerUserId  String     @db.Uuid
+  status        String     @default("COMPLETED") // COMPLETED | CANCELLED
+  paymentStatus String     @default("UNPAID") // UNPAID | PARTIAL | PAID (cf Payment Engine §13)
+  currency      String
+  subtotal      Decimal    @db.Decimal(18, 4)
+  taxTotal      Decimal    @default(0) @db.Decimal(18, 4)
+  discountTotal Decimal    @default(0) @db.Decimal(18, 4)
+  grandTotal    Decimal    @db.Decimal(18, 4)
+  amountPaid    Decimal    @default(0) @db.Decimal(18, 4)
+  balanceDue    Decimal    @default(0) @db.Decimal(18, 4)
+  operationId   String     @db.Uuid // clé d'idempotence (cf docs/architecture/01-analyse-risques.md §4.4)
+  deviceId      String?    @db.Uuid
+  createdAt     DateTime   @default(now())
+  deletedAt     DateTime?
+  lines         SaleLine[]
+  payments      Payment[]
+  documents     Document[]
+
+  @@unique([tenantId, operationId])
+  @@index([tenantId, locationId, createdAt])
+}
+
+// Snapshot immuable (cf docs/architecture/03-modele-donnees.md §3.3) : le nom produit, l'unité,
+// le prix et le taux de taxe sont figés au moment de la vente, jamais recalculés depuis Product.
+model SaleLine {
+  id                  String  @id @db.Uuid
+  tenantId            String  @db.Uuid
+  saleId              String  @db.Uuid
+  productId           String  @db.Uuid
+  productNameSnapshot String
+  unitSnapshot        String
+  quantity            Decimal @db.Decimal(18, 4)
+  // 1 unitSnapshot = conversionFactorSnapshot × unité de RÉFÉRENCE du produit
+  // au moment de la vente (cf ProductUnit) — figé même si la conversion change
+  // ensuite (cf docs/architecture/03-modele-donnees.md §3.3, snapshot immuable).
+  conversionFactorSnapshot Decimal @default(1) @db.Decimal(18, 6)
+  unitPriceSnapshot   Decimal @db.Decimal(18, 4)
+  costPriceSnapshot   Decimal? @db.Decimal(18, 4) // Snapshot du coût de revient au moment de la vente (marge historique immuable)
+  // Traçabilité de la résolution de prix (cf docs/architecture/02-moteurs.md §8) :
+  // BASE_PRICE | CUSTOMER_OVERRIDE | QUANTITY_TIER.
+  appliedPriceRule    String  @default("BASE_PRICE")
+  taxRateSnapshot     Decimal @default(0) @db.Decimal(6, 4)
+  lineTotal           Decimal @db.Decimal(18, 4)
+  sale                Sale    @relation(fields: [saleId], references: [id])
+
+  @@index([tenantId, saleId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// RETURNS / REFUNDS (Phase 11 — capability "returns"). Acte atomique et
+// immuable une fois créé (comme une vente : pas de cycle de statuts, pas
+// d'annulation — une erreur se corrige par un nouveau mouvement, jamais en
+// réécrivant l'historique, cf docs/architecture/03-modele-donnees.md §3.3).
+// La quantité retournée est exprimée dans la MÊME unité que la ligne de
+// vente d'origine (`unitSnapshot`/`conversionFactorSnapshot` recopiés depuis
+// SaleLine) : la réintégration en stock se calcule dans l'unité de
+// RÉFÉRENCE, exactement comme la décrémentation initiale (SalesService).
+// Un article DEFECTIVE n'est jamais réintégré au stock vendable (traçabilité
+// du stock défectueux lui-même = PLANNED, Inventory 2.0).
+// ─────────────────────────────────────────────────────────────────────────
+model Return {
+  id                String       @id @db.Uuid
+  tenantId          String       @db.Uuid
+  saleId            String       @db.Uuid
+  locationId        String       @db.Uuid
+  customerId        String?      @db.Uuid
+  processedByUserId String       @db.Uuid
+  reason            String
+  refundMethod      String? // CASH | MOBILE_MONEY | CARD | BANK_TRANSFER | CHECK — absent si aucun remboursement traité (échange = PLANNED)
+  refundAmount      Decimal      @db.Decimal(18, 4)
+  operationId       String       @db.Uuid
+  createdAt         DateTime     @default(now())
+  lines             ReturnLine[]
+  documents         Document[]
+
+  @@unique([tenantId, operationId])
+  @@index([tenantId, saleId])
+}
+
+model ReturnLine {
+  id                       String  @id @db.Uuid
+  tenantId                 String  @db.Uuid
+  returnId                 String  @db.Uuid
+  saleLineId               String  @db.Uuid
+  productId                String  @db.Uuid
+  productNameSnapshot      String
+  unitSnapshot             String
+  conversionFactorSnapshot Decimal @default(1) @db.Decimal(18, 6)
+  quantity                 Decimal @db.Decimal(18, 4)
+  unitPriceSnapshot        Decimal @db.Decimal(18, 4)
+  lineTotal                Decimal @db.Decimal(18, 4)
+  condition                String // GOOD | DEFECTIVE
+  restocked                Boolean @default(false)
+  return                   Return  @relation(fields: [returnId], references: [id])
+
+  @@index([tenantId, returnId])
+  @@index([tenantId, saleLineId])
+}
+
+// Multi-méthode et multi-paiement par vente (cf docs/architecture/02-moteurs.md §13).
+// Paiement électronique asynchrone (webhook PSP) et remboursement = PLANNED.
+model Payment {
+  id        String   @id @db.Uuid
+  tenantId  String   @db.Uuid
+  saleId    String   @db.Uuid
+  method    String // CASH | MOBILE_MONEY | CARD | BANK_TRANSFER | CHECK
+  amount    Decimal  @db.Decimal(18, 4)
+  currency  String
+  status    String   @default("COMPLETED")
+  createdAt DateTime @default(now())
+  sale      Sale     @relation(fields: [saleId], references: [id])
+  // Rattachement best-effort à la session de caisse ouverte au moment du
+  // paiement CASH (cf CashSession ci-dessous, Cash Register Engine) — reste
+  // NULL si aucune session n'était ouverte ou si le paiement n'est pas en
+  // espèces : une vente ne dépend JAMAIS de l'existence d'une session de
+  // caisse, cf SalesService (aucune régression sur le comportement existant).
+  cashSessionId String?      @db.Uuid
+  cashSession   CashSession? @relation(fields: [cashSessionId], references: [id])
+
+  @@index([tenantId, saleId])
+  @@index([tenantId, cashSessionId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CAISSE (Cash Register Engine — cf docs/architecture/02-moteurs.md §15)
+// Une session par emplacement à la fois (contrainte d'unicité partielle
+// ajoutée à la main dans la migration, cf pattern déjà suivi pour la RLS).
+// Portée volontairement simple : fond de caisse, mouvements manuels
+// (dépôt/retrait), rattachement des paiements CASH, écart au comptage.
+// ─────────────────────────────────────────────────────────────────────────
+model CashSession {
+  id             String    @id @db.Uuid
+  tenantId       String    @db.Uuid
+  locationId     String    @db.Uuid
+  status         String    @default("OPEN") // OPEN | CLOSED
+  openedByUserId String    @db.Uuid
+  openedAt       DateTime  @default(now())
+  openingFloat   Decimal   @db.Decimal(18, 4)
+  closedByUserId String?   @db.Uuid
+  closedAt       DateTime?
+  // Renseignés uniquement à la fermeture (cf CashRegisterService.closeSession) :
+  // countedAmount = compté physiquement, expectedAmount = fond de caisse +
+  // paiements CASH rattachés + entrées manuelles - sorties manuelles,
+  // discrepancy = countedAmount - expectedAmount (positif = excédent).
+  countedAmount  Decimal?  @db.Decimal(18, 4)
+  expectedAmount Decimal?  @db.Decimal(18, 4)
+  discrepancy    Decimal?  @db.Decimal(18, 4)
+  notes          String?
+
+  movements CashMovement[]
+  payments  Payment[]
+
+  @@index([tenantId, locationId])
+}
+
+// Mouvement manuel de caisse (dépôt/retrait hors vente) — les encaissements de
+// vente en espèces sont déjà tracés via Payment.cashSessionId, pas dupliqués ici.
+model CashMovement {
+  id              String      @id @db.Uuid
+  tenantId        String      @db.Uuid
+  sessionId       String      @db.Uuid
+  type            String // CASH_IN | CASH_OUT
+  amount          Decimal     @db.Decimal(18, 4)
+  reason          String
+  createdByUserId String      @db.Uuid
+  createdAt       DateTime    @default(now())
+  session         CashSession @relation(fields: [sessionId], references: [id])
+
+  @@index([tenantId, sessionId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DOCUMENTS (Document Engine minimal — cf docs/architecture/02-moteurs.md §16)
+// ─────────────────────────────────────────────────────────────────────────
+
+// Compteur de numérotation PAR EMPLACEMENT ET PAR SÉRIE — option A retenue par
+// défaut dans docs/architecture/01-analyse-risques.md §5.4 (robuste à l'offline
+// futur, au prix d'une numérotation non strictement continue au niveau tenant).
+// Le mode "numéro définitif attribué à la synchronisation" reste PLANNED et
+// configurable par tenant/pays plus tard (Configuration Engine, non implémenté).
+model DocumentSequence {
+  id         String   @id @db.Uuid
+  tenantId   String   @db.Uuid
+  locationId String   @db.Uuid
+  series     String // ex: "RECEIPT" — une série par type de document
+  lastNumber Int      @default(0)
+  updatedAt  DateTime @updatedAt
+
+  @@unique([tenantId, locationId, series])
+  @@index([tenantId])
+}
+
+// Snapshot immuable (cf docs/architecture/03-modele-donnees.md §3.3 et
+// docs/architecture/02-moteurs.md §16) : le contenu JSON est figé à l'émission,
+// jamais recalculé depuis Sale/Product/Customer après coup.
+model Document {
+  id             String    @id @db.Uuid
+  tenantId       String    @db.Uuid
+  // RECEIPT (auto, à la vente) | INVOICE (à la demande, depuis une vente) |
+  // QUOTE (à la demande, depuis une commande — devis, aucun effet métier) |
+  // CREDIT_NOTE (auto, à un retour remboursé) | DELIVERY_NOTE (auto, à la
+  // livraison — Phase 14, cf docs/PROJECT_STATUS.md).
+  type           String
+  number         String // ex: "PC03-000123" ou "REC-000045" (série-numéro)
+  saleId         String?   @db.Uuid
+  orderId        String?   @db.Uuid // QUOTE et DELIVERY_NOTE
+  returnId       String?   @db.Uuid // CREDIT_NOTE
+  contentSnapshot Json
+  voidedAt       DateTime?
+  voidReason     String?
+  createdAt      DateTime  @default(now())
+  sale           Sale?     @relation(fields: [saleId], references: [id])
+  order          Order?    @relation(fields: [orderId], references: [id])
+  return         Return?   @relation(fields: [returnId], references: [id])
+
+  @@unique([tenantId, number])
+  @@index([tenantId, saleId])
+  @@index([tenantId, orderId])
+  @@index([tenantId, returnId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DELIVERY ENGINE (Phase 14, capability "delivery", dépend du module
+// "orders" déjà déclaré dans ModuleRegistry). Une livraison est rattachée à
+// UNE commande (contrainte d'unicité — plusieurs expéditions pour la même
+// commande = PLANNED). Cycle PENDING (planifiée) → OUT_FOR_DELIVERY (partie)
+// → DELIVERED (génère un DELIVERY_NOTE) ou FAILED (échec, ex: client
+// absent) ; CANCELLED possible avant DELIVERED. La livraison NE déclenche
+// JAMAIS automatiquement la complétion de la commande (paiement/stock) —
+// ce sont deux actions distinctes assumées séparément pour cette phase (cf
+// docs/PROJECT_STATUS.md), l'opérateur complète la commande via
+// POST /orders/:id/complete quand le paiement est réellement encaissé.
+// ─────────────────────────────────────────────────────────────────────────
+model Delivery {
+  id               String    @id @db.Uuid
+  tenantId         String    @db.Uuid
+  orderId          String    @db.Uuid
+  status           String    @default("PENDING") // PENDING | OUT_FOR_DELIVERY | DELIVERED | FAILED | CANCELLED
+  address          String
+  scheduledDate    DateTime?
+  assignedUserId   String?   @db.Uuid
+  createdByUserId  String    @db.Uuid
+  operationId      String    @db.Uuid
+  failureReason    String?
+  cancelReason     String?
+  createdAt        DateTime  @default(now())
+  outForDeliveryAt DateTime?
+  deliveredAt      DateTime?
+  cancelledAt      DateTime?
+
+  @@unique([tenantId, operationId])
+  @@unique([tenantId, orderId])
+  @@index([tenantId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// EVENTS / AUDIT (pattern Outbox — cf docs/architecture/01-analyse-risques.md §4.2)
+// ─────────────────────────────────────────────────────────────────────────
+
+model OutboxEvent {
+  id          String    @id @db.Uuid
+  tenantId    String    @db.Uuid
+  eventType   String // ex: "sales.sale.completed"
+  payload     Json
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([processedAt])
+  @@index([tenantId, createdAt])
+}
+
+model AuditLog {
+  id          String   @id @db.Uuid
+  tenantId    String   @db.Uuid
+  actorUserId String?  @db.Uuid
+  actorType   String   @default("USER") // USER | SYSTEM
+  eventType   String
+  entityType  String
+  entityId    String   @db.Uuid
+  payload     Json
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entityType, entityId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SOCIAL INBOX & MESSAGING (Facebook, Instagram, TikTok, WhatsApp)
+// Intégrations conformes aux APIs officielles (Meta Graph, WhatsApp Cloud, TikTok Business).
+// ─────────────────────────────────────────────────────────────────────────
+
+model SocialAccount {
+  id             String    @id @db.Uuid
+  tenantId       String    @db.Uuid
+  platform       String    // FACEBOOK | INSTAGRAM | TIKTOK | WHATSAPP
+  accountName    String
+  externalId     String    // Page ID, IG Business Account ID, TikTok App User, Phone Number ID
+  status         String    @default("NON_CONFIGURE")
+  encryptedToken String?
+  tokenExpiresAt DateTime?
+  metadata       Json?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  conversations SocialConversation[]
+
+  @@unique([tenantId, platform, externalId])
+  @@index([tenantId, platform])
+}
+
+model SocialConversation {
+  id                String    @id @db.Uuid
+  tenantId          String    @db.Uuid
+  accountId         String    @db.Uuid
+  platform          String
+  externalThreadId  String
+  contactName       String?
+  contactIdentifier String?
+  customerId        String?   @db.Uuid
+  status            String    @default("OPEN") // OPEN | RESOLVED | PENDING
+  lastMessageAt     DateTime  @default(now())
+  unreadCount       Int       @default(0)
+  internalNotes     String?
+  assignedUserId    String?   @db.Uuid
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  account           SocialAccount   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  messages          SocialMessage[]
+
+  @@unique([tenantId, accountId, externalThreadId])
+  @@index([tenantId, platform, lastMessageAt])
+  @@index([tenantId, customerId])
+}
+
+model SocialMessage {
+  id             String    @id @db.Uuid
+  tenantId       String    @db.Uuid
+  conversationId String    @db.Uuid
+  direction      String    // INBOUND | OUTBOUND
+  senderId       String
+  senderName     String?
+  content        String
+  attachments    Json?
+  deliveryStatus String    @default("SENT") // PENDING | SENT | DELIVERED | READ | FAILED
+  externalMsgId  String?
+  errorMessage   String?
+  isAutomated    Boolean   @default(false)
+  sentAt         DateTime  @default(now())
+
+  conversation   SocialConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, conversationId, sentAt])
+}
+
+model SocialConsent {
+  id          String    @id @db.Uuid
+  tenantId    String    @db.Uuid
+  channel     String    // WHATSAPP | SMS | EMAIL
+  recipient   String    // Numéro téléphone ou email
+  category    String    // MARKETING | UTILITY | TRANSACTIONAL | CREDIT_REMINDER
+  optInStatus String    @default("OPTED_IN") // OPTED_IN | OPTED_OUT
+  source      String
+  proof       String?
+  optInAt     DateTime  @default(now())
+  optOutAt    DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([tenantId, channel, recipient, category])
+  @@index([tenantId, recipient])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// EXPENSES & FINANCIAL TRACKING (Module Dépenses — cf Partie 3)
+// Gestion rigoureuse des dépenses opérationnelles (loyer, salaires, énergie...)
+// Réconciliation caisse & paiements, sans double comptage avec les achats de stock.
+// ─────────────────────────────────────────────────────────────────────────
+
+model Expense {
+  id                 String    @id @db.Uuid
+  tenantId           String    @db.Uuid
+  locationId         String?   @db.Uuid
+  category           String    // RENT | SALARIES | UTILITIES | TRANSPORT | SUPPLIES | MARKETING | MAINTENANCE | TAXES | OTHER
+  amount             Decimal   @db.Decimal(18, 4)
+  currency           String    @default("XOF")
+  description        String
+  beneficiary        String?
+  paymentMethod      String    @default("CASH") // CASH | MOBILE_MONEY | CARD | BANK_TRANSFER | CHECK
+  cashSessionId      String?   @db.Uuid
+  status             String    @default("APPROVED") // DRAFT | PENDING_APPROVAL | APPROVED | REJECTED | PAID
+  receiptUrl         String?
+  attachmentId       String?   @db.Uuid
+  isRecurring        Boolean   @default(false)
+  recurrenceInterval String?   // MONTHLY | WEEKLY | QUARTERLY | YEARLY
+  createdByUserId    String    @db.Uuid
+  approvedByUserId   String?   @db.Uuid
+  rejectedReason     String?
+  paidAt             DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, category])
+  @@index([tenantId, status])
+  @@index([tenantId, locationId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FILE STORAGE & MEDIA ASSETS (Stockage d'objets, documents et médias — cf Partie 4)
+// Métadonnées immuables, hash SHA256, détection type MIME et quotas par plan.
+// ─────────────────────────────────────────────────────────────────────────
+
+model StoredFile {
+  id               String    @id @db.Uuid
+  tenantId         String    @db.Uuid
+  uploadedByUserId String    @db.Uuid
+  fileName         String
+  originalName     String
+  mimeType         String
+  sizeBytes        Int
+  hashSha256       String
+  storagePath      String
+  storageProvider  String    @default("LOCAL") // LOCAL | S3
+  category         String    @default("ATTACHMENT") // DOCUMENT | EXPENSE_RECEIPT | PRODUCT_IMAGE | LOGO | EXPORT | BACKUP | ATTACHMENT
+  scanStatus       String    @default("CLEAN") // CLEAN | PENDING | INFECTED | UNCHECKED
+  isPublic         Boolean   @default(false)
+  retentionDays    Int?
+  expiresAt        DateTime?
+  metadata         Json?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, category])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AUTOMATION ENGINE & RULES (Moteur d'automatisation configurable — cf Partie 7 & 14)
+// Déclencheurs, conditions, actions, traçabilité et historique d'exécutions anti-boucle.
+// ─────────────────────────────────────────────────────────────────────────
+
+model AutomationRule {
+  id              String    @id @db.Uuid
+  tenantId        String    @db.Uuid
+  name            String
+  description     String?
+  trigger         String    // STOCK_LOW | EXPENSE_CREATED | PAYMENT_RECEIVED | ORDER_CONFIRMED | INVOICE_OVERDUE | CRON_DAILY
+  conditions      Json      // ex: {"amountGreaterThan": 100000} ou {"stockBelow": 5}
+  actions         Json      // ex: [{"type": "ALERT", "channel": "IN_APP", "recipientRole": "MANAGER"}]
+  timeWindow      String?
+  isActive        Boolean   @default(true)
+  lastTriggeredAt DateTime?
+  executionCount  Int       @default(0)
+  failureCount    Int       @default(0)
+  createdByUserId String    @db.Uuid
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  executionLogs AutomationExecutionLog[]
+
+  @@index([tenantId, isActive])
+  @@index([tenantId, trigger])
+}
+
+model AutomationExecutionLog {
+  id           String   @id @db.Uuid
+  tenantId     String   @db.Uuid
+  ruleId       String   @db.Uuid
+  triggerEvent String
+  status       String   // SUCCESS | FAILED | SKIPPED
+  inputPayload Json?
+  outputPayload Json?
+  errorMessage String?
+  durationMs   Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  rule AutomationRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, ruleId, createdAt])
+  @@index([tenantId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DIAGNOSTICS & SAFE SYSTEM REPAIR (Outil de diagnostic et réparation sûre — cf Partie 6)
+// Scans d'intégrité en lecture seule, détection d'anomalies, réparations réversibles.
+// ─────────────────────────────────────────────────────────────────────────
+
+model DiagnosticScan {
+  id                String    @id @db.Uuid
+  tenantId          String?   @db.Uuid // null = scan global plateforme superadmin
+  type              String    // FULL_SYSTEM | TENANT_INTEGRITY | ORPHAN_FILES | CACHE_AND_INDEX | OUTBOX_HEALTH
+  status            String    @default("SUCCESS") // SUCCESS | WARNING | CRITICAL
+  scope             String    @default("TENANT") // PLATFORM | TENANT
+  triggeredByUserId String    @db.Uuid
+  findings          Json
+  repairsExecuted   Json?
+  createdAt         DateTime  @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([scope, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SERVICES & PRESTATIONS (Partie 26 — cycle de vie complet des interventions)
+// Diagnostic, devis, planification, pièces consommées en stock, rentabilité et facturation.
+// ─────────────────────────────────────────────────────────────────────────
+
+model ServiceOrder {
+  id                       String             @id @db.Uuid
+  tenantId                 String             @db.Uuid
+  locationId               String             @db.Uuid
+  referenceNumber          String             // ex: SRV-7594BE-000001
+  customerId               String?            @db.Uuid
+  assignedUserId           String?            @db.Uuid
+  title                    String
+  description              String?
+  diagnosisNotes           String?
+  resolutionNotes          String?
+  status                   String             @default("DRAFT") // DRAFT | QUALIFIED | SCHEDULED | IN_PROGRESS | ON_HOLD | COMPLETED | BILLED | CANCELLED
+  priority                 String             @default("NORMAL") // LOW | NORMAL | HIGH | URGENT
+  scheduledDate            DateTime?
+  estimatedDurationMinutes Int?
+  actualDurationMinutes    Int?
+  hourlyLaborRate          Decimal?           @db.Decimal(18, 4)
+  laborCost                Decimal            @default(0) @db.Decimal(18, 4)
+  partsCost                Decimal            @default(0) @db.Decimal(18, 4)
+  otherCost                Decimal            @default(0) @db.Decimal(18, 4)
+  totalCost                Decimal            @default(0) @db.Decimal(18, 4)
+  quotedPrice              Decimal            @default(0) @db.Decimal(18, 4)
+  finalPrice               Decimal            @default(0) @db.Decimal(18, 4)
+  grossMargin              Decimal            @default(0) @db.Decimal(18, 4)
+  saleId                   String?            @db.Uuid
+  invoiceId                String?            @db.Uuid
+  createdAt                DateTime           @default(now())
+  updatedAt                DateTime           @updatedAt
+  completedAt              DateTime?
+
+  items                    ServiceOrderItem[]
+
+  @@unique([tenantId, referenceNumber])
+  @@index([tenantId, locationId, status])
+  @@index([tenantId, customerId])
+  @@index([tenantId, assignedUserId])
+}
+
+model ServiceOrderItem {
+  id              String       @id @db.Uuid
+  tenantId        String       @db.Uuid
+  serviceOrderId  String       @db.Uuid
+  productId       String?      @db.Uuid
+  itemType        String       // LABOR | PART | OTHER
+  name            String
+  quantity        Decimal      @db.Decimal(18, 4)
+  unitCost        Decimal      @default(0) @db.Decimal(18, 4)
+  unitPrice       Decimal      @db.Decimal(18, 4)
+  lineTotal       Decimal      @db.Decimal(18, 4)
+  stockDeducted   Boolean      @default(false)
+  stockMovementId String?      @db.Uuid
+  createdAt       DateTime     @default(now())
+
+  serviceOrder    ServiceOrder @relation(fields: [serviceOrderId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, serviceOrderId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// RÉSERVATIONS / RENDEZ-VOUS (CAPABILITIES.RESERVATIONS)
+// Prise de rendez-vous ou réservation de créneau client.
+// ─────────────────────────────────────────────────────────────────────────
+
+model Appointment {
+  id              String    @id @db.Uuid
+  tenantId        String    @db.Uuid
+  locationId      String    @db.Uuid
+  customerId      String?   @db.Uuid
+  assignedUserId  String?   @db.Uuid
+  title           String
+  description     String?
+  scheduledAt     DateTime
+  durationMinutes Int       @default(30)
+  status          String    @default("CONFIRMED") // PENDING | CONFIRMED | COMPLETED | CANCELLED | NO_SHOW
+  customerName    String?
+  customerPhone   String?
+  customerEmail   String?
+  serviceName     String?
+  notes           String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([tenantId, locationId, scheduledAt])
+  @@index([tenantId, customerId])
+  @@index([tenantId, assignedUserId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PANIERS SUSPENDUS (HELD CARTS — Phase 2 & 4 Audit QA)
+// Table transactionnelle PostgreSQL isolée par tenant (RLS).
+// Protège contre les accès concurrents, crash d'écriture et persistance inter-reconnexions.
+// ─────────────────────────────────────────────────────────────────────────
+
+model HeldCart {
+  id              String    @id @db.Uuid
+  tenantId        String    @db.Uuid
+  locationId      String    @db.Uuid
+  sellerUserId    String    @db.Uuid
+  customerId      String?   @db.Uuid
+  customerName    String?
+  label           String
+  items           Json
+  estimatedTotal  Decimal   @db.Decimal(18, 4)
+  currency        String    @default("XOF")
+  status          String    @default("HELD") // HELD | RESUMED | DISCARDED | EXPIRED
+  resumedAt       DateTime?
+  resumedByUserId String?   @db.Uuid
+  expiresAt       DateTime
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([tenantId, locationId, status])
+  @@index([tenantId, status, expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// WEBHOOKS PSP / PAIEMENTS PLATEFORME (Phase 1 & 4 Audit QA)
+// Registre persistant dans PostgreSQL avec déduplication stricte par (provider, eventId).
+// Prévient le double traitement multi-instances et journalise les tentatives/erreurs.
+// ─────────────────────────────────────────────────────────────────────────
+
+model PspWebhookEvent {
+  id                String    @id @db.Uuid
+  provider          String
+  eventId           String
+  signatureVerified Boolean   @default(true)
+  status            String    @default("PENDING") // PENDING | PROCESSED | FAILED
+  attempts          Int       @default(1)
+  payload           Json
+  receivedAt        DateTime  @default(now())
+  processedAt       DateTime?
+  result            Json?
+  lastError         String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([provider, eventId])
+  @@index([provider, status])
+}
+
+
+

@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tutoriel Vidéo 10s — Configuration Espace de Travail</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #1e293b 0%, #0f172a 100%);
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+    }
+    .container {
+      width: 100%;
+      max-width: 940px;
+      background: rgba(30, 41, 59, 0.7);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: #34d399;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 9999px;
+    }
+    .badge-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.85); }
+    }
+    h1 {
+      font-size: 22px;
+      font-weight: 800;
+      color: #ffffff;
+      letter-spacing: -0.02em;
+    }
+    p.sub {
+      color: #94a3b8;
+      font-size: 14px;
+      margin-top: 4px;
+    }
+    .video-viewport {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #020617;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.4);
+    }
+    .video-content {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #0b0f19;
+    }
+    .overlay-curtain {
+      position: absolute;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.65);
+      backdrop-filter: blur(4px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      transition: opacity 0.3s ease;
+      z-index: 10;
+    }
+    .overlay-curtain.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .btn-play-big {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 32px;
+      background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+      color: #ffffff;
+      font-size: 17px;
+      font-weight: 700;
+      border: none;
+      border-radius: 14px;
+      cursor: pointer;
+      box-shadow: 0 10px 25px -3px rgba(37, 99, 235, 0.5);
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .btn-play-big:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 15px 30px -3px rgba(37, 99, 235, 0.6);
+      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+    }
+    .btn-play-big svg {
+      width: 24px;
+      height: 24px;
+      fill: currentColor;
+    }
+    .subtitles-container {
+      position: absolute;
+      bottom: 60px;
+      left: 20px;
+      right: 20px;
+      text-align: center;
+      z-index: 5;
+      pointer-events: none;
+    }
+    .subtitles-box {
+      display: inline-block;
+      max-width: 80%;
+      background: rgba(15, 23, 42, 0.88);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 10px 18px;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 600;
+      color: #ffffff;
+      line-height: 1.4;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      transition: all 0.2s ease;
+    }
+    .subtitles-box span.active {
+      color: #60a5fa;
+      text-shadow: 0 0 12px rgba(96, 165, 250, 0.5);
+    }
+    .controls-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      background: rgba(15, 23, 42, 0.95);
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 6;
+    }
+    .btn-control {
+      background: none;
+      border: none;
+      color: #e2e8f0;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      transition: background 0.15s ease;
+    }
+    .btn-control:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: #ffffff;
+    }
+    .progress-bar-container {
+      flex: 1;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 3px;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #3b82f6, #10b981);
+      border-radius: 3px;
+      transition: width 0.1s linear;
+    }
+    .time-display {
+      font-size: 13px;
+      font-weight: 600;
+      color: #94a3b8;
+      font-variant-numeric: tabular-nums;
+      min-width: 68px;
+      text-align: right;
+    }
+    .steps-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 20px;
+    }
+    @media (max-width: 700px) {
+      .steps-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .step-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px;
+      padding: 14px;
+      transition: all 0.2s ease;
+    }
+    .step-card.active {
+      border-color: #3b82f6;
+      background: rgba(59, 130, 246, 0.08);
+      box-shadow: 0 0 16px rgba(59, 130, 246, 0.15);
+    }
+    .step-num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: #334155;
+      color: #94a3b8;
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .step-card.active .step-num {
+      background: #2563eb;
+      color: #ffffff;
+    }
+    .step-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 4px;
+    }
+    .step-desc {
+      font-size: 12px;
+      color: #94a3b8;
+      line-height: 1.4;
+    }
+    .footer-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 24px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .btn-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #38bdf8;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 600;
+      transition: color 0.15s ease;
+    }
+    .btn-link:hover {
+      color: #7dd3fc;
+      text-decoration: underline;
+    }
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      background: #10b981;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 700;
+      border-radius: 10px;
+      text-decoration: none;
+      transition: background 0.15s ease;
+    }
+    .btn-primary:hover {
+      background: #059669;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <div class="badge">
+          <span class="badge-dot"></span>
+          Échantillon Chronométré — 10 Secondes
+        </div>
+        <h1 style="margin-top: 8px;">Tutoriel : Configurer son Espace de Travail</h1>
+        <p class="sub">Démonstration vidéo réelle avec voix française fluide et sous-titres synchronisés.</p>
+      </div>
+      <div>
+        <a href="http://localhost:5180/settings" target="_blank" class="btn-primary">
+          Ouvrir l'application réelle ↗
+        </a>
+      </div>
+    <div style="background: linear-gradient(135deg, #1e293b, #0f172a); border: 1px solid #3b82f6; border-radius: 12px; padding: 14px 18px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+      <div>
+        <div style="font-weight: 800; font-size: 14px; color: #60a5fa; display: flex; align-items: center; gap: 6px;">
+          <span>🎥</span> <span>Série Complète Disponible : 8 Vidéos Full HD 1080p VTM</span>
+        </div>
+        <div style="font-size: 13px; color: #cbd5e1; margin-top: 3px;">
+          Retrouvez les 8 modules de formation commentés en français (Configuration, Caisse POS, Stocks, Atelier, Dépenses, Crédits...).
+        </div>
+      </div>
+      <a href="http://localhost:5180/help" style="background: #2563eb; color: #ffffff; padding: 8px 16px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: 700;">
+        Accéder au Centre d'Aide & Vidéos ↗
+      </a>
+    </div>
+
+    <!-- Video Viewport -->
+    <div class="video-viewport" id="viewport">
+      <img id="videoImage" class="video-content" src="/tutoriel_10s_demo.webp" alt="Enregistrement du gestionnaire" />
+
+      <!-- Subtitles -->
+      <div class="subtitles-container">
+        <div class="subtitles-box" id="subtitles">
+          Cliquez sur <strong>Lancer la Vidéo</strong> pour écouter et regarder.
+        </div>
+      </div>
+
+      <!-- Play Curtain -->
+      <div class="overlay-curtain" id="curtain">
+        <button class="btn-play-big" id="btnStart">
+          <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+          ▶ Lancer la Vidéo avec Voix (10s)
+        </button>
+        <span style="font-size: 13px; color: #94a3b8;">Voix française claire • Vidéo réelle de l'interface</span>
+      </div>
+
+      <!-- Controls Bar -->
+      <div class="controls-bar">
+        <button class="btn-control" id="btnTogglePlay" title="Lecture / Pause">
+          <svg id="playIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          <svg id="pauseIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+        </button>
+        <button class="btn-control" id="btnReplay" title="Rejouer depuis le début">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+        </button>
+        <div class="progress-bar-container" id="progressBar">
+          <div class="progress-bar-fill" id="progressFill"></div>
+        </div>
+        <div class="time-display" id="timeDisplay">00:00 / 00:10</div>
+      </div>
+    </div>
+
+    <!-- Step Breakdown -->
+    <div class="steps-grid">
+      <div class="step-card" id="stepCard1">
+        <div class="step-num">1</div>
+        <div class="step-title">0s – 3s : Accès Paramètres</div>
+        <div class="step-desc">« Bonjour ! Pour configurer votre espace de travail, cliquez sur Paramètres à gauche. »</div>
+      </div>
+      <div class="step-card" id="stepCard2">
+        <div class="step-num">2</div>
+        <div class="step-title">3s – 7s : Nom, Devise & Logo</div>
+        <div class="step-desc">« Indiquez le nom commercial de votre boutique, votre devise, puis importez votre logo. »</div>
+      </div>
+      <div class="step-card" id="stepCard3">
+        <div class="step-num">3</div>
+        <div class="step-title">7s – 10s : Validation & Prêt</div>
+        <div class="step-desc">« Enregistrez : vos factures et votre caisse sont immédiatement prêtes ! »</div>
+      </div>
+    </div>
+
+    <div class="footer-actions">
+      <a href="http://localhost:5180" target="_blank" class="btn-link">
+        ← Retourner au Tableau de Bord
+      </a>
+      <span style="font-size: 13px; color: #64748b;">
+        Gestionnaire SaaS Universel de Commerce • Vidéo HD 10s
+      </span>
+    </div>
+  </div>
+
+  <script>
+    const TOTAL_DURATION_SEC = 10;
+    let isPlaying = false;
+    let startTime = 0;
+    let timerInterval = null;
+    let currentSpeech = null;
+
+    const curtain = document.getElementById('curtain');
+    const btnStart = document.getElementById('btnStart');
+    const btnTogglePlay = document.getElementById('btnTogglePlay');
+    const btnReplay = document.getElementById('btnReplay');
+    const playIcon = document.getElementById('playIcon');
+    const pauseIcon = document.getElementById('pauseIcon');
+    const progressFill = document.getElementById('progressFill');
+    const timeDisplay = document.getElementById('timeDisplay');
+    const subtitles = document.getElementById('subtitles');
+    const videoImage = document.getElementById('videoImage');
+
+    const card1 = document.getElementById('stepCard1');
+    const card2 = document.getElementById('stepCard2');
+    const card3 = document.getElementById('stepCard3');
+
+    const narrationScript = [
+      {
+        start: 0,
+        end: 3.2,
+        card: card1,
+        text: "Bonjour ! Pour configurer votre espace de travail, cliquez sur Paramètres à gauche."
+      },
+      {
+        start: 3.2,
+        end: 7.2,
+        card: card2,
+        text: "Indiquez le nom de votre boutique, votre devise, puis importez votre logo officiel."
+      },
+      {
+        start: 7.2,
+        end: 10.0,
+        card: card3,
+        text: "Enregistrez : vos factures et votre caisse sont immédiatement prêtes !"
+      }
+    ];
+
+    function speakFrench() {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+
+      const fullText = "Bonjour ! Pour configurer votre espace de travail, cliquez sur Paramètres à gauche. Indiquez le nom commercial de votre boutique, votre devise, puis importez votre logo officiel. Enregistrez : vos factures et votre caisse sont immédiatement prêtes !";
+      currentSpeech = new SpeechSynthesisUtterance(fullText);
+      currentSpeech.lang = 'fr-FR';
+      currentSpeech.rate = 1.05; // Cadence fluide et naturelle
+      currentSpeech.pitch = 1.0;
+
+      // Chercher une voix française de haute qualité
+      const voices = window.speechSynthesis.getVoices();
+      const frenchVoice = voices.find(v => v.lang.startsWith('fr') && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Julie') || v.name.includes('Paul') || v.name.includes('Thomas'))) || voices.find(v => v.lang.startsWith('fr'));
+      if (frenchVoice) {
+        currentSpeech.voice = frenchVoice;
+      }
+
+      window.speechSynthesis.speak(currentSpeech);
+    }
+
+    function startPlayback() {
+      curtain.classList.add('hidden');
+      isPlaying = true;
+      playIcon.style.display = 'none';
+      pauseIcon.style.display = 'block';
+
+      // Recharger l'image/animation webp pour synchroniser dès le début
+      videoImage.src = '/tutoriel_10s_demo.webp?t=' + Date.now();
+
+      startTime = Date.now();
+      speakFrench();
+
+      clearInterval(timerInterval);
+      timerInterval = setInterval(updateProgress, 80);
+    }
+
+    function stopPlayback() {
+      isPlaying = false;
+      playIcon.style.display = 'block';
+      pauseIcon.style.display = 'none';
+      clearInterval(timerInterval);
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    }
+
+    function updateProgress() {
+      const elapsed = (Date.now() - startTime) / 1000;
+
+      if (elapsed >= TOTAL_DURATION_SEC) {
+        progressFill.style.width = '100%';
+        timeDisplay.textContent = '00:10 / 00:10';
+        subtitles.innerHTML = "✅ <strong>Configuration terminée avec succès !</strong>";
+        stopPlayback();
+        curtain.classList.remove('hidden');
+        return;
+      }
+
+      const percent = (elapsed / TOTAL_DURATION_SEC) * 100;
+      progressFill.style.width = percent.toFixed(1) + '%';
+
+      const secStr = Math.floor(elapsed).toString().padStart(2, '0');
+      timeDisplay.textContent = `00:${secStr} / 00:10`;
+
+      // Détection de la tranche active et sous-titres
+      card1.classList.remove('active');
+      card2.classList.remove('active');
+      card3.classList.remove('active');
+
+      const currentStep = narrationScript.find(s => elapsed >= s.start && elapsed < s.end);
+      if (currentStep) {
+        currentStep.card.classList.add('active');
+        subtitles.innerHTML = `🎙️ <span class="active">${currentStep.text}</span>`;
+      }
+    }
+
+    btnStart.addEventListener('click', startPlayback);
+    btnTogglePlay.addEventListener('click', () => {
+      if (isPlaying) {
+        stopPlayback();
+      } else {
+        startPlayback();
+      }
+    });
+
+    btnReplay.addEventListener('click', () => {
+      stopPlayback();
+      startPlayback();
+    });
+
+    // Chargement des voix dès que le navigateur est prêt
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.onvoiceschanged = () => {
+        window.speechSynthesis.getVoices();
+      };
+    }
+  </script>
+</body>
+</html>
